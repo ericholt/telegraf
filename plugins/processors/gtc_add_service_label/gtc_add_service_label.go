@@ -6,6 +6,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,13 +32,20 @@ type PodMap struct {
 	mutexData sync.RWMutex
 	data      map[string]Data
 
-	mutexRefresh    sync.Mutex
-	wgRefreshing    sync.WaitGroup
-	wgTriggered     sync.WaitGroup
-	triggerRefresh  chan bool
-	refreshInterval int
+	refreshInterval time.Duration
+
+	k8sClient *kubernetes.Clientset
 
 	log telegraf.Logger
+}
+
+func NewPodMap(refreshInterval int, log telegraf.Logger) *PodMap {
+	return &PodMap{
+		data:            make(map[string]Data),
+		refreshInterval: time.Duration(refreshInterval) * time.Minute,
+		k8sClient:       getK8sClient(),
+		log:             log,
+	}
 }
 
 func (tm *PodMap) Set(key, value string) {
@@ -58,86 +66,48 @@ func (tm *PodMap) GetWait(key string) (string, bool) {
 	if data, ok := tm.Get(key); ok {
 		return data, ok
 	}
-	// prevent multiple threads from starting refresh simultaneously
-	tm.mutexRefresh.Lock()
-	{
-		// protected by mutexRefresh (extra safety)
-		// wait if refresh in progress
-		tm.wgRefreshing.Wait()
-		// try getting value following potential refresh
-		if data, ok := tm.Get(key); ok {
-			tm.mutexRefresh.Unlock()
-			return data, ok
-		}
-		tm.log.Infof("gtc_add_service_label - trigger refresh for pod %s", key)
-		// trigger refresh
-		tm.wgTriggered.Add(1)
-		tm.triggerRefresh <- true
-		// wait for refresh to begin (we can't wait on wgRefreshing before Add(1) is called on it)
-		tm.wgTriggered.Wait()
-		// wait for refresh to end
-		tm.wgRefreshing.Wait()
-	}
-	tm.mutexRefresh.Unlock()
 
-	// return value
-	return tm.Get(key)
+	namespace, podName := splitPodKey(key)
+	pod, err := downloadPod(tm.k8sClient, namespace, podName)
+	if err != nil {
+		tm.log.Errorf("gtc_add_service_label - error getting pod %s from api server: %v", key, err)
+		return "", false
+	}
+
+	service := createServiceLabel(pod)
+	tm.mutexData.Lock()
+	defer tm.mutexData.Unlock()
+	tm.data[key] = Data{service, time.Now()}
+	tm.log.Infof("gtc_add_service_label - got service label %s for pod %s, pod-service map size = %d", service, key, len(tm.data))
+
+	return service, true
 }
 
-func (tm *PodMap) StartCleanupLoop() {
+func (tm *PodMap) StartRefreshLoop() {
+	// blocking
+	tm.populateMap()
+	// populate every refreshInterval
+	// - will automatically remove old pods
 	go func() {
-		// runs every (5*refreshInterval) and removes pods that are more than (5*refreshInterval) old
-		interval := 5 * tm.getRefreshInterval()
 		for {
-			time.Sleep(interval)
+			time.Sleep(tm.refreshInterval)
+			// populate
+			tm.populateMap()
+			// delete old pods (older than twice refreshInterval)
 			tm.mutexData.Lock()
 			for key, data := range tm.data {
-				if time.Since(data.Timestamp) > interval {
+				if time.Since(data.Timestamp) > (2 * tm.refreshInterval) {
 					delete(tm.data, key)
 				}
 			}
-			tm.log.Infof("gtc_add_service_label - after cleanup pod-service map size = %d", len(tm.data))
 			tm.mutexData.Unlock()
+			tm.log.Infof("gtc_add_service_label - after cleanup pod-service map size = %d", len(tm.data))
 		}
 	}()
 }
 
-func (tm *PodMap) PopulateRefresh() {
-	k8sClient := getK8sClient()
-	// blocking
-	tm.populateMap(k8sClient)
-	tm.triggerRefresh = make(chan bool)
-	// non-blocking
-	// populate every x minutes
-	// - will automatically remove old pods
-	// TODO-nice-to-have: keep old pods for 1 extra cycle since some metrics might arrive right after pod termination
-	go func() {
-		interval := tm.getRefreshInterval()
-		for {
-			timer := time.After(interval)
-			select {
-			case <-timer:
-				tm.mutexRefresh.Lock()
-				tm.wgRefreshing.Add(1)
-				tm.mutexRefresh.Unlock()
-				tm.log.Info("gtc_add_service_label - start refresh after time interval reached")
-			case <-tm.triggerRefresh:
-				tm.wgRefreshing.Add(1)
-				tm.wgTriggered.Done()
-				tm.log.Info("gtc_add_service_label - start refresh after triggered")
-			}
-			tm.populateMap(k8sClient)
-			tm.wgRefreshing.Done()
-		}
-	}()
-}
-
-func (tm *PodMap) getRefreshInterval() time.Duration {
-	return time.Duration(tm.refreshInterval) * time.Minute
-}
-
-func (tm *PodMap) populateMap(k8sClient *kubernetes.Clientset) {
-	pods, err := downloadPods(k8sClient)
+func (tm *PodMap) populateMap() {
+	pods, err := downloadPods(tm.k8sClient)
 	if err != nil {
 		tm.log.Errorf("gtc_add_service_label - error populating pod-service map: %v", err)
 	}
@@ -145,7 +115,8 @@ func (tm *PodMap) populateMap(k8sClient *kubernetes.Clientset) {
 	tmpMap := make(map[string]Data)
 	now := time.Now()
 	for _, pod := range pods.Items {
-		tmpMap[pod.Name] = Data{createServiceLabel(&pod), now}
+		podKey := createPodKey(pod.Namespace, pod.Name)
+		tmpMap[podKey] = Data{createServiceLabel(&pod), now}
 	}
 	tm.log.Infof("gtc_add_service_label - tmp map size = %d", len(tmpMap))
 	if len(tmpMap) <= 0 {
@@ -181,8 +152,15 @@ func getK8sClient() *kubernetes.Clientset {
 	return client
 }
 
+func downloadPod(clientset *kubernetes.Clientset, namespace string, podName string) (*corev1.Pod, error) {
+	pod, err := clientset.CoreV1().Pods(namespace).Get(context.TODO(), podName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("unable to retrieve pod %s in namespace %s from k8s api: %v", podName, namespace, err)
+	}
+	return pod, nil
+}
+
 func downloadPods(clientset *kubernetes.Clientset) (*corev1.PodList, error) {
-	// Use Get("pod_name") instead (and namespace if possible)
 	pods, err := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("unable to retrieve pods from k8s api: %v", err)
@@ -202,15 +180,31 @@ func createServiceLabel(pod *corev1.Pod) string {
 	return service
 }
 
-// stored tags global var
-var podServiceMap *PodMap
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Plugin
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+func podKeyFromMetric(metric telegraf.Metric) string {
+	if namespace, ok := metric.GetTag("namespace"); ok {
+		if pod, ok := metric.GetTag("pod"); ok {
+			return createPodKey(namespace, pod)
+		}
+	}
+	return ""
+}
+
+func createPodKey(namespace string, pod string) string {
+	return fmt.Sprintf("%s/%s", namespace, pod)
+}
+
+func splitPodKey(key string) (string, string) {
+	splitKey := strings.Split(key, "/")
+	return splitKey[0], splitKey[1]
+}
+
 type AddServiceLabel struct {
-	parallel parallel.Parallel
+	podServiceMap *PodMap
+	parallel      parallel.Parallel
 
 	LabelName       string `toml:"label"`
 	MaxQueued       int    `toml:"max_queued"`
@@ -234,15 +228,13 @@ func (p *AddServiceLabel) Init() error {
 // we protect it with an if nil because podServiceMap is global and
 // Start is called once per instance of the plugin
 func (p *AddServiceLabel) Start(acc telegraf.Accumulator) error {
-	if podServiceMap == nil {
-		podServiceMap = &PodMap{
-			data:            make(map[string]Data),
-			refreshInterval: p.RefreshInterval,
-			log:             p.Log,
-		}
-		podServiceMap.PopulateRefresh()
+	if p.podServiceMap == nil {
+		p.podServiceMap = NewPodMap(
+			p.RefreshInterval,
+			p.Log,
+		)
+		p.podServiceMap.StartRefreshLoop()
 		p.Log.Info("gtc_add_service_label - map initialized")
-		podServiceMap.StartCleanupLoop()
 	}
 	// Only 1 worker since there's no need to query api server multiple times
 	p.parallel = parallel.NewOrdered(acc, p.asyncAdd, p.MaxQueued, 1)
@@ -251,8 +243,8 @@ func (p *AddServiceLabel) Start(acc telegraf.Accumulator) error {
 }
 
 func (p *AddServiceLabel) Add(metric telegraf.Metric, acc telegraf.Accumulator) error {
-	if pod, ok := metric.GetTag("pod"); ok {
-		if service, ok := podServiceMap.Get(pod); ok {
+	if podKey := podKeyFromMetric(metric); len(podKey) > 0 {
+		if service, ok := p.podServiceMap.Get(podKey); ok {
 			// 'service' can be empty string
 			if len(service) > 0 {
 				metric.RemoveTag(p.LabelName)
@@ -271,13 +263,13 @@ func (p *AddServiceLabel) Add(metric telegraf.Metric, acc telegraf.Accumulator) 
 }
 
 func (p *AddServiceLabel) asyncAdd(metric telegraf.Metric) []telegraf.Metric {
-	if pod, ok := metric.GetTag("pod"); ok {
-		if service, ok := podServiceMap.GetWait(pod); len(service) > 0 {
+	if podKey := podKeyFromMetric(metric); len(podKey) > 0 {
+		if service, ok := p.podServiceMap.GetWait(podKey); len(service) > 0 {
 			metric.RemoveTag(p.LabelName)
 			metric.AddTag(p.LabelName, service)
-			p.Log.Infof("gtc_add_service_label - label added for %s", pod)
+			p.Log.Infof("gtc_add_service_label - label added for %s", podKey)
 		} else {
-			p.Log.Infof("gtc_add_service_label - label not added for %s - service='%s' - ok='%t'", pod, service, ok)
+			p.Log.Infof("gtc_add_service_label - label not added for %s - service='%s' - ok='%t'", podKey, service, ok)
 		}
 	}
 	return []telegraf.Metric{metric}
@@ -292,7 +284,7 @@ func init() {
 		return &AddServiceLabel{
 			LabelName:       "service",
 			MaxQueued:       10000,
-			RefreshInterval: 5,
+			RefreshInterval: 15,
 		}
 	})
 }
