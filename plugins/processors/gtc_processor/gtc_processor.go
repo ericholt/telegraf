@@ -85,16 +85,18 @@ func (tm *PodMap) GetWait(key string) (string, bool) {
 	pod, err := downloadPod(tm.k8sClient, namespace, podName)
 	if err != nil {
 		tm.statQueryErrors.Incr(1)
-		tm.log.Errorf("gtc_add_service_label - error getting pod %s from api server: %v", key, err)
+		tm.log.Errorf("gtc_processor - error getting pod %s from api server: %v", key, err)
 		return "", false
 	}
 
 	service := createServiceLabel(pod)
+
 	tm.mutexData.Lock()
 	defer tm.mutexData.Unlock()
+
 	tm.data[key] = Data{service, time.Now()}
 	tm.statItemCount.Set(int64(len(tm.data)))
-	tm.log.Infof("gtc_add_service_label - got service label %s for pod %s, pod-service map size = %d", service, key, len(tm.data))
+	tm.log.Infof("gtc_processor - got service label %s for pod %s, pod-service map size = %d", service, key, len(tm.data))
 
 	return service, true
 }
@@ -104,7 +106,7 @@ func (tm *PodMap) StartRefreshLoop() {
 	tm.populateMap()
 	tm.statRefreshCount.Incr(1)
 	tm.statItemCount.Set(int64(len(tm.data)))
-	tm.log.Infof("gtc_add_service_label - initial pod-service map size = %d", len(tm.data))
+	tm.log.Infof("gtc_processor - initial pod-service map size = %d", len(tm.data))
 	// populate every refreshInterval
 	// - will automatically remove old pods
 	go func() {
@@ -121,7 +123,7 @@ func (tm *PodMap) StartRefreshLoop() {
 				}
 			}
 			tm.statItemCount.Set(int64(len(tm.data)))
-			tm.log.Infof("gtc_add_service_label - after cleanup pod-service map size = %d", len(tm.data))
+			tm.log.Infof("gtc_processor - after cleanup pod-service map size = %d", len(tm.data))
 			tm.mutexData.Unlock()
 		}
 	}()
@@ -131,7 +133,7 @@ func (tm *PodMap) populateMap() {
 	pods, err := downloadPods(tm.k8sClient)
 	if err != nil {
 		tm.statQueryErrors.Incr(1)
-		tm.log.Errorf("gtc_add_service_label - error populating pod-service map: %v", err)
+		tm.log.Errorf("gtc_processor - error populating pod-service map: %v", err)
 	}
 
 	tmpMap := make(map[string]Data)
@@ -140,9 +142,9 @@ func (tm *PodMap) populateMap() {
 		podKey := createPodKey(pod.Namespace, pod.Name)
 		tmpMap[podKey] = Data{createServiceLabel(&pod), now}
 	}
-	tm.log.Infof("gtc_add_service_label - tmp map size = %d", len(tmpMap))
+	tm.log.Infof("gtc_processor - tmp map size = %d", len(tmpMap))
 	if len(tmpMap) <= 0 {
-		tm.log.Warn("gtc_add_service_label - created pod-service map is empty")
+		tm.log.Warn("gtc_processor - created pod-service map is empty")
 	}
 
 	tm.mutexData.Lock()
@@ -151,7 +153,7 @@ func (tm *PodMap) populateMap() {
 	for k, v := range tmpMap {
 		tm.data[k] = v
 	}
-	tm.log.Infof("gtc_add_service_label - new pod-service map size = %d", len(tm.data))
+	tm.log.Infof("gtc_processor - new pod-service map size = %d", len(tm.data))
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -232,8 +234,15 @@ type AddServiceLabel struct {
 	MaxQueued       int    `toml:"max_queued"`
 	RefreshInterval int    `toml:"refresh_interval"`
 
-	statQueueLimit selfstat.Stat
-	statQueueSize  selfstat.Stat
+	statQueueLimit                selfstat.Stat
+	statQueueSize                 selfstat.Stat
+	statEnqueue                   selfstat.Stat
+	statDequeue                   selfstat.Stat
+	statMetricReceived            selfstat.Stat
+	statMetricProcessedNone       selfstat.Stat
+	statMetricProcessedAdded      selfstat.Stat
+	statMetricProcessedNoneAsync  selfstat.Stat
+	statMetricProcessedAddedAsync selfstat.Stat
 
 	Log telegraf.Logger `toml:"-"`
 }
@@ -248,6 +257,13 @@ func (*AddServiceLabel) SampleConfig() string {
 func (p *AddServiceLabel) Init() error {
 	p.statQueueLimit = selfstat.Register("gtc_processor", "queue_limit", map[string]string{})
 	p.statQueueSize = selfstat.Register("gtc_processor", "queue_size", map[string]string{})
+	p.statEnqueue = selfstat.Register("gtc_processor", "enqueue", map[string]string{})
+	p.statDequeue = selfstat.Register("gtc_processor", "dequeue", map[string]string{})
+	p.statMetricReceived = selfstat.Register("gtc_processor", "received", map[string]string{})
+	p.statMetricProcessedNone = selfstat.Register("gtc_processor", "processed", map[string]string{"exec": "sync", "service_label": "none"})
+	p.statMetricProcessedAdded = selfstat.Register("gtc_processor", "processed", map[string]string{"exec": "sync", "service_label": "added"})
+	p.statMetricProcessedNoneAsync = selfstat.Register("gtc_processor", "processed", map[string]string{"exec": "async", "service_label": "none"})
+	p.statMetricProcessedAddedAsync = selfstat.Register("gtc_processor", "processed", map[string]string{"exec": "async", "service_label": "added"})
 
 	p.statQueueLimit.Set(int64(p.MaxQueued))
 
@@ -264,46 +280,58 @@ func (p *AddServiceLabel) Start(acc telegraf.Accumulator) error {
 			p.Log,
 		)
 		p.podServiceMap.StartRefreshLoop()
-		p.Log.Info("gtc_add_service_label - map initialized")
+		p.Log.Info("gtc_processor - map initialized")
 	}
 	// Only 1 worker since there's no need to query api server multiple times
 	p.parallel = parallel.NewOrdered(acc, p.asyncAdd, p.MaxQueued, 1)
-	p.Log.Info("gtc_add_service_label - plugin started")
+	p.Log.Info("gtc_processor - plugin started")
 	return nil
 }
 
 func (p *AddServiceLabel) Add(metric telegraf.Metric, acc telegraf.Accumulator) error {
+	p.statMetricReceived.Incr(1)
+	statMetricProcessed := p.statMetricProcessedNone
+	addAsyncQueue := false
+
 	if podKey := podKeyFromMetric(metric); len(podKey) > 0 {
-		if service, ok := p.podServiceMap.Get(podKey); ok {
-			// 'service' can be empty string
-			if len(service) > 0 {
-				metric.RemoveTag(p.LabelName)
-				metric.AddTag(p.LabelName, service)
-			}
-			acc.AddMetric(metric)
-		} else {
-			// Add to parallel queue to retrieve 'service' label in background
-			p.statQueueSize.Incr(1)
-			p.parallel.Enqueue(metric)
+		if service, ok := p.podServiceMap.Get(podKey); len(service) > 0 {
+			metric.RemoveTag(p.LabelName)
+			metric.AddTag(p.LabelName, service)
+			statMetricProcessed = p.statMetricProcessedAdded
+		} else if !ok {
+			addAsyncQueue = true
 		}
+	}
+
+	if addAsyncQueue {
+		p.statEnqueue.Incr(1)
+		p.statQueueSize.Incr(1)
+		// Add to parallel queue to retrieve 'service' label in background
+		p.parallel.Enqueue(metric)
 	} else {
 		acc.AddMetric(metric)
+		statMetricProcessed.Incr(1)
 	}
 
 	return nil
 }
 
 func (p *AddServiceLabel) asyncAdd(metric telegraf.Metric) []telegraf.Metric {
-	if podKey := podKeyFromMetric(metric); len(podKey) > 0 {
-		if service, ok := p.podServiceMap.GetWait(podKey); len(service) > 0 {
-			metric.RemoveTag(p.LabelName)
-			metric.AddTag(p.LabelName, service)
-			p.Log.Infof("gtc_add_service_label - label added for %s", podKey)
-		} else {
-			p.Log.Infof("gtc_add_service_label - label not added for %s - service='%s' - ok='%t'", podKey, service, ok)
-		}
-	}
+	p.statDequeue.Incr(1)
 	p.statQueueSize.Incr(-1)
+	statMetricProcessed := p.statMetricProcessedNoneAsync
+
+	podKey := podKeyFromMetric(metric)
+	if service, ok := p.podServiceMap.GetWait(podKey); len(service) > 0 {
+		metric.RemoveTag(p.LabelName)
+		metric.AddTag(p.LabelName, service)
+		statMetricProcessed = p.statMetricProcessedAddedAsync
+		p.Log.Infof("gtc_processor async - label added for %s", podKey)
+	} else {
+		p.Log.Infof("gtc_processor async - label not added for %s - service='%s' - ok='%t'", podKey, service, ok)
+	}
+
+	statMetricProcessed.Incr(1)
 	return []telegraf.Metric{metric}
 }
 
@@ -312,7 +340,7 @@ func (p *AddServiceLabel) Stop() {
 }
 
 func init() {
-	processors.AddStreaming("gtc_add_service_label", func() telegraf.StreamingProcessor {
+	processors.AddStreaming("gtc_processor", func() telegraf.StreamingProcessor {
 		return &AddServiceLabel{
 			LabelName:       "service",
 			MaxQueued:       10000,
