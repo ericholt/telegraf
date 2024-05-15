@@ -1,6 +1,6 @@
-package gtc_join_service
+package gtc_processor
 
-// gtc_join_service.go
+// gtc_processor.go
 
 import (
 	"context"
@@ -21,8 +21,14 @@ import (
 )
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// PodMap TODO: move to another file
+// PodMap
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+type PodMapGetter interface {
+	Get(string) (string, bool)
+	GetWait(string) (string, bool)
+	StartRefreshLoop()
+}
 
 type Data struct {
 	Value     string
@@ -34,6 +40,7 @@ type PodMap struct {
 	data      map[string]Data
 
 	refreshInterval time.Duration
+	cacheDuration   time.Duration
 
 	k8sClient *kubernetes.Clientset
 
@@ -44,22 +51,17 @@ type PodMap struct {
 	log telegraf.Logger
 }
 
-func NewPodMap(refreshInterval int, log telegraf.Logger) *PodMap {
+func NewPodMap(refreshInterval int, cacheDuration int, log telegraf.Logger) *PodMap {
 	return &PodMap{
 		data:             make(map[string]Data),
 		refreshInterval:  time.Duration(refreshInterval) * time.Minute,
+		cacheDuration:    time.Duration(cacheDuration) * time.Minute,
 		k8sClient:        getK8sClient(),
 		statRefreshCount: selfstat.Register("gtc_processor", "refresh_count", map[string]string{}),
 		statItemCount:    selfstat.Register("gtc_processor", "cache_size", map[string]string{}),
 		statQueryErrors:  selfstat.Register("gtc_processor", "query_errors", map[string]string{}),
 		log:              log,
 	}
-}
-
-func (tm *PodMap) Set(key, value string) {
-	tm.mutexData.Lock()
-	defer tm.mutexData.Unlock()
-	tm.data[key] = Data{Value: value, Timestamp: time.Now()}
 }
 
 func (tm *PodMap) Get(key string) (string, bool) {
@@ -69,36 +71,37 @@ func (tm *PodMap) Get(key string) (string, bool) {
 	return data.Value, ok
 }
 
-func (tm *PodMap) Size() int {
-	tm.mutexData.RLock()
-	defer tm.mutexData.RUnlock()
-	return len(tm.data)
-}
-
 func (tm *PodMap) GetWait(key string) (string, bool) {
 	// try getting value
 	if data, ok := tm.Get(key); ok {
 		return data, ok
 	}
 
+	ok := true
+	var service string
+	var timestamp time.Time
 	namespace, podName := splitPodKey(key)
 	pod, err := downloadPod(tm.k8sClient, namespace, podName)
 	if err != nil {
 		tm.statQueryErrors.Incr(1)
 		tm.log.Errorf("gtc_processor - error getting pod %s from api server: %v", key, err)
-		return "", false
+		ok = false
+		// we still want to add empty string service value for the pod but remove at next refresh
+		service = ""
+		timestamp = time.Now().Add(-tm.cacheDuration)
+	} else {
+		service = createServiceLabel(pod)
+		timestamp = time.Now()
 	}
-
-	service := createServiceLabel(pod)
 
 	tm.mutexData.Lock()
 	defer tm.mutexData.Unlock()
 
-	tm.data[key] = Data{service, time.Now()}
+	tm.data[key] = Data{service, timestamp}
 	tm.statItemCount.Set(int64(len(tm.data)))
 	tm.log.Infof("gtc_processor - got service label %s for pod %s, pod-service map size = %d", service, key, len(tm.data))
 
-	return service, true
+	return service, ok
 }
 
 func (tm *PodMap) StartRefreshLoop() {
@@ -118,7 +121,7 @@ func (tm *PodMap) StartRefreshLoop() {
 			// delete old pods (older than twice refreshInterval)
 			tm.mutexData.Lock()
 			for key, data := range tm.data {
-				if time.Since(data.Timestamp) > (2 * tm.refreshInterval) {
+				if time.Since(data.Timestamp) > tm.cacheDuration {
 					delete(tm.data, key)
 				}
 			}
@@ -226,15 +229,16 @@ func splitPodKey(key string) (string, string) {
 	return splitKey[0], splitKey[1]
 }
 
-type AddServiceLabel struct {
-	podServiceMap *PodMap
+type GtcProcessor struct {
+	podServiceMap PodMapGetter
 	parallel      parallel.Parallel
 
-	LabelName       string `toml:"label"`
-	MaxQueued       int    `toml:"max_queued"`
-	RefreshInterval int    `toml:"refresh_interval"`
+	LabelName string `toml:"label"`
+	// MaxQueued       int    `toml:"max_queued"`
+	RefreshInterval int `toml:"refresh_interval"`
+	CacheDuration   int `toml:"cache_duration"`
 
-	statQueueLimit                selfstat.Stat
+	// statQueueLimit                selfstat.Stat
 	statQueueSize                 selfstat.Stat
 	statEnqueue                   selfstat.Stat
 	statDequeue                   selfstat.Stat
@@ -250,12 +254,12 @@ type AddServiceLabel struct {
 //go:embed sample.conf
 var sampleConfig string
 
-func (*AddServiceLabel) SampleConfig() string {
+func (*GtcProcessor) SampleConfig() string {
 	return sampleConfig
 }
 
-func (p *AddServiceLabel) Init() error {
-	p.statQueueLimit = selfstat.Register("gtc_processor", "queue_limit", map[string]string{})
+func (p *GtcProcessor) Init() error {
+	// p.statQueueLimit = selfstat.Register("gtc_processor", "queue_limit", map[string]string{})
 	p.statQueueSize = selfstat.Register("gtc_processor", "queue_size", map[string]string{})
 	p.statEnqueue = selfstat.Register("gtc_processor", "enqueue", map[string]string{})
 	p.statDequeue = selfstat.Register("gtc_processor", "dequeue", map[string]string{})
@@ -265,7 +269,7 @@ func (p *AddServiceLabel) Init() error {
 	p.statMetricProcessedNoneAsync = selfstat.Register("gtc_processor", "processed", map[string]string{"exec": "async", "service_label": "none"})
 	p.statMetricProcessedAddedAsync = selfstat.Register("gtc_processor", "processed", map[string]string{"exec": "async", "service_label": "added"})
 
-	p.statQueueLimit.Set(int64(p.MaxQueued))
+	// p.statQueueLimit.Set(int64(p.MaxQueued))
 
 	return nil
 }
@@ -273,28 +277,29 @@ func (p *AddServiceLabel) Init() error {
 // Start initalizes the podServiceMap global map
 // we protect it with an if nil because podServiceMap is global and
 // Start is called once per instance of the plugin
-func (p *AddServiceLabel) Start(acc telegraf.Accumulator) error {
+func (p *GtcProcessor) Start(acc telegraf.Accumulator) error {
 	if p.podServiceMap == nil {
 		p.podServiceMap = NewPodMap(
 			p.RefreshInterval,
+			p.CacheDuration,
 			p.Log,
 		)
 		p.podServiceMap.StartRefreshLoop()
 		p.Log.Info("gtc_processor - map initialized")
 	}
 	// Only 1 worker since there's no need to query api server multiple times
-	p.parallel = parallel.NewOrdered(acc, p.asyncAdd, p.MaxQueued, 1)
+	p.parallel = parallel.NewOrdered(acc, p.asyncAdd, 10, 1) // removed p.MaxQueued as value since we block depending on number of workers anyway (10 will never be reached, double workers is max)
 	p.Log.Info("gtc_processor - plugin started")
 	return nil
 }
 
-func (p *AddServiceLabel) Add(metric telegraf.Metric, acc telegraf.Accumulator) error {
+func (p *GtcProcessor) Add(metric telegraf.Metric, acc telegraf.Accumulator) error {
 	p.statMetricReceived.Incr(1)
 	statMetricProcessed := p.statMetricProcessedNone
 	addAsyncQueue := false
 
 	if podKey := podKeyFromMetric(metric); len(podKey) > 0 {
-		if service, ok := p.podServiceMap.Get(podKey); len(service) > 0 {
+		if service, ok := (PodMapGetter)(p.podServiceMap).Get(podKey); len(service) > 0 {
 			metric.RemoveTag(p.LabelName)
 			metric.AddTag(p.LabelName, service)
 			statMetricProcessed = p.statMetricProcessedAdded
@@ -316,13 +321,13 @@ func (p *AddServiceLabel) Add(metric telegraf.Metric, acc telegraf.Accumulator) 
 	return nil
 }
 
-func (p *AddServiceLabel) asyncAdd(metric telegraf.Metric) []telegraf.Metric {
+func (p *GtcProcessor) asyncAdd(metric telegraf.Metric) []telegraf.Metric {
 	p.statDequeue.Incr(1)
 	p.statQueueSize.Incr(-1)
 	statMetricProcessed := p.statMetricProcessedNoneAsync
 
 	podKey := podKeyFromMetric(metric)
-	if service, ok := p.podServiceMap.GetWait(podKey); len(service) > 0 {
+	if service, ok := (PodMapGetter)(p.podServiceMap).GetWait(podKey); len(service) > 0 {
 		metric.RemoveTag(p.LabelName)
 		metric.AddTag(p.LabelName, service)
 		statMetricProcessed = p.statMetricProcessedAddedAsync
@@ -335,16 +340,17 @@ func (p *AddServiceLabel) asyncAdd(metric telegraf.Metric) []telegraf.Metric {
 	return []telegraf.Metric{metric}
 }
 
-func (p *AddServiceLabel) Stop() {
+func (p *GtcProcessor) Stop() {
 	p.parallel.Stop()
 }
 
 func init() {
 	processors.AddStreaming("gtc_processor", func() telegraf.StreamingProcessor {
-		return &AddServiceLabel{
-			LabelName:       "service",
-			MaxQueued:       10000,
-			RefreshInterval: 15,
+		return &GtcProcessor{
+			LabelName: "service",
+			// MaxQueued:       10000,
+			RefreshInterval: 1,
+			CacheDuration:   30,
 		}
 	})
 }
