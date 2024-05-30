@@ -6,6 +6,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -53,23 +54,25 @@ type PodMap struct {
 
 	k8sClient *kubernetes.Clientset
 
-	statRefreshCount selfstat.Stat
-	statItemCount    selfstat.Stat
-	statQueryErrors  selfstat.Stat
+	statRefreshSuccessCount selfstat.Stat
+	statRefreshFailCount    selfstat.Stat
+	statItemCount           selfstat.Stat
+	statQueryErrors         selfstat.Stat
 
 	log telegraf.Logger
 }
 
 func NewPodMap(refreshInterval int, cacheDuration int, log telegraf.Logger) *PodMap {
 	return &PodMap{
-		data:             make(map[string]Data),
-		refreshInterval:  time.Duration(refreshInterval) * time.Minute,
-		cacheDuration:    time.Duration(cacheDuration) * time.Minute,
-		k8sClient:        getK8sClient(),
-		statRefreshCount: selfstat.Register("gtc_processor", "refresh_count", map[string]string{}),
-		statItemCount:    selfstat.Register("gtc_processor", "cache_size", map[string]string{}),
-		statQueryErrors:  selfstat.Register("gtc_processor", "query_errors", map[string]string{}),
-		log:              log,
+		data:                    make(map[string]Data),
+		refreshInterval:         time.Duration(refreshInterval) * time.Minute,
+		cacheDuration:           time.Duration(cacheDuration) * time.Minute,
+		k8sClient:               getK8sClient(),
+		statRefreshSuccessCount: selfstat.Register("gtc_processor", "refresh_count", map[string]string{"result": "success"}),
+		statRefreshFailCount:    selfstat.Register("gtc_processor", "refresh_count", map[string]string{"result": "fail"}),
+		statItemCount:           selfstat.Register("gtc_processor", "cache_size", map[string]string{}),
+		statQueryErrors:         selfstat.Register("gtc_processor", "query_errors", map[string]string{}),
+		log:                     log,
 	}
 }
 
@@ -93,7 +96,7 @@ func (tm *PodMap) GetWait(key string) (string, DataStatus) {
 	var timestamp time.Time
 	var status DataStatus
 	namespace, podName := splitPodKey(key)
-	pod, err := downloadPod(tm.k8sClient, namespace, podName)
+	pod, err := tm.downloadPod(namespace, podName)
 	if err != nil {
 		tm.statQueryErrors.Incr(1)
 		// We get the following error when a pod no longer exists but it's metrics are still being collected:
@@ -104,7 +107,7 @@ func (tm *PodMap) GetWait(key string) (string, DataStatus) {
 		timestamp = time.Now().Add(-tm.cacheDuration)
 		status = DROP
 	} else {
-		service = createServiceLabel(pod)
+		service = createServiceLabel(pod.Annotations)
 		timestamp = time.Now()
 		status = OK
 	}
@@ -120,9 +123,11 @@ func (tm *PodMap) GetWait(key string) (string, DataStatus) {
 }
 
 func (tm *PodMap) StartRefreshLoop() {
-	// blocking
-	tm.populateMap()
-	tm.statRefreshCount.Incr(1)
+	// blocking, crash if map initialization fails
+	if err := tm.populateMap(); err != nil {
+		panic(err)
+	}
+	tm.statRefreshSuccessCount.Incr(1)
 	tm.statItemCount.Set(int64(len(tm.data)))
 	tm.log.Infof("gtc_processor - initial pod-service map size = %d", len(tm.data))
 	// populate every refreshInterval
@@ -131,8 +136,12 @@ func (tm *PodMap) StartRefreshLoop() {
 		for {
 			time.Sleep(tm.refreshInterval)
 			// populate
-			tm.populateMap()
-			tm.statRefreshCount.Incr(1)
+			if err := tm.populateMap(); err != nil {
+				tm.statRefreshFailCount.Incr(1)
+				tm.log.Warnf("gtc_processor - map refresh failed")
+				continue
+			}
+			tm.statRefreshSuccessCount.Incr(1)
 			// delete old pods (older than twice refreshInterval)
 			tm.mutexData.Lock()
 			for key, data := range tm.data {
@@ -147,18 +156,19 @@ func (tm *PodMap) StartRefreshLoop() {
 	}()
 }
 
-func (tm *PodMap) populateMap() {
+func (tm *PodMap) populateMap() error {
 	pods, err := downloadPods(tm.k8sClient)
 	if err != nil {
 		tm.statQueryErrors.Incr(1)
 		tm.log.Errorf("gtc_processor - error populating pod-service map: %v", err)
+		return err
 	}
 
 	now := time.Now()
 	tmpMap := make(map[string]Data)
 	for _, pod := range pods.Items {
 		podKey := createPodKey(pod.Namespace, pod.Name)
-		tmpMap[podKey] = Data{createServiceLabel(&pod), now, OK}
+		tmpMap[podKey] = Data{createServiceLabel(pod.Annotations), now, OK}
 	}
 	tm.log.Infof("gtc_processor - tmp map size = %d", len(tmpMap))
 	if len(tmpMap) <= 0 {
@@ -172,49 +182,54 @@ func (tm *PodMap) populateMap() {
 		tm.data[k] = v
 	}
 	tm.log.Infof("gtc_processor - new pod-service map size = %d", len(tm.data))
+
+	return nil
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// API Server - TODO move to another file
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+func (tm *PodMap) downloadPod(namespace string, podName string) (*corev1.Pod, error) {
+	var pod *corev1.Pod
+	var err error
 
+	pod, err = tm.k8sClient.CoreV1().Pods(namespace).Get(context.TODO(), podName, metav1.GetOptions{})
+	if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "connection reset by peer" {
+		tm.k8sClient = getK8sClient()
+		pod, err = tm.k8sClient.CoreV1().Pods(namespace).Get(context.TODO(), podName, metav1.GetOptions{})
+	}
+	if err != nil {
+		err = fmt.Errorf("unable to retrieve pod %s in namespace %s from k8s api: %v", podName, namespace, err)
+	}
+
+	return pod, err
+}
+
+// This function causes program termination if an error occurs
 func getK8sClient() *kubernetes.Clientset {
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		// TODO
 		panic(err.Error())
 	}
 
 	client, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		// TODO
 		panic(err.Error())
 	}
 
 	return client
 }
 
-func downloadPod(clientset *kubernetes.Clientset, namespace string, podName string) (*corev1.Pod, error) {
-	pod, err := clientset.CoreV1().Pods(namespace).Get(context.TODO(), podName, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("unable to retrieve pod %s in namespace %s from k8s api: %v", podName, namespace, err)
-	}
-	return pod, nil
-}
-
 func downloadPods(clientset *kubernetes.Clientset) (*corev1.PodList, error) {
 	pods, err := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("unable to retrieve pods from k8s api: %v", err)
+		err = fmt.Errorf("unable to retrieve pods from k8s api: %v", err)
 	}
-	return pods, nil
+	return pods, err
 }
 
-func createServiceLabel(pod *corev1.Pod) string {
-	service, ok := pod.Annotations["prometheus.io/label-service"]
+func createServiceLabel(annotations map[string]string) string {
+	service, ok := annotations["prometheus.io/label-service"]
 	if !ok {
-		if project, ok := pod.Annotations["app.tug.jive.com/project"]; ok {
-			if app, ok := pod.Annotations["app.tug.jive.com/app"]; ok {
+		if project, ok := annotations["app.tug.jive.com/project"]; ok {
+			if app, ok := annotations["app.tug.jive.com/app"]; ok {
 				service = project + "/" + app
 			}
 		}
